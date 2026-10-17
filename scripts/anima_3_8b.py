@@ -33,8 +33,9 @@ class Anima3BScript(scripts.Script):
                 choices=choices,
                 value=choices[0],
                 info=(
-                    "Legacy v1 only. Bundled anima.3-8B-v2 checkpoints "
-                    "activate automatically and ignore this selector."
+                    "Legacy v1 adapter, or a v2 connector sidecar (fixed strength 1.0). "
+                    "Bundled anima.3-8B-v2 checkpoints activate automatically "
+                    "and ignore this selector."
                 ),
             )
             strength = gr.Slider(

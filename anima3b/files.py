@@ -9,6 +9,8 @@ ARCHITECTURE = "anima_progressive_qwen35_cross_adapter_v1"
 V2_ARCHITECTURE = "anima_qwen35_quality_anchored_semantic_connector_v2"
 BUNDLE_ARCHITECTURE = "anima_3_8b_semantic_connector_v2_bundle"
 BUNDLE_FORMAT = "1"
+# A v2 connector extracted from a bundle: bundle metadata, connector tensors only.
+SIDECAR_ARCHITECTURE = "anima_v2_connector_sidecar"
 CONNECTOR_PREFIX = "net.anima_v2_connector."
 
 
@@ -51,6 +53,21 @@ def bundle_metadata(path: str | os.PathLike) -> dict[str, str] | None:
     return metadata
 
 
+def sidecar_metadata(path: str | os.PathLike) -> dict[str, str] | None:
+    try:
+        with safe_open(path, framework="pt", device="cpu") as checkpoint:
+            metadata = checkpoint.metadata() or {}
+    except (OSError, ValueError, SafetensorError):
+        return None
+    if (
+        metadata.get("architecture") != SIDECAR_ARCHITECTURE
+        or metadata.get("anima_v2_bundle_format") != BUNDLE_FORMAT
+        or metadata.get("anima_v2_adapter_architecture") != V2_ARCHITECTURE
+    ):
+        return None
+    return metadata
+
+
 def adapters() -> dict[str, str]:
     found: dict[str, str] = {}
     for root in text_encoder_roots():
@@ -59,7 +76,7 @@ def adapters() -> dict[str, str]:
                 with safe_open(path, framework="pt", device="cpu") as checkpoint:
                     metadata = checkpoint.metadata() or {}
                     keys = set(checkpoint.keys())
-                if metadata.get("architecture") != ARCHITECTURE:
+                if metadata.get("architecture") not in (ARCHITECTURE, SIDECAR_ARCHITECTURE):
                     continue
                 if any(key.startswith(("timestep_gates.", "anchor_deviation")) for key in keys):
                     continue

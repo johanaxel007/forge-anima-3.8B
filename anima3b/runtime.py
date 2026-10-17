@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file
 
 from backend import memory_management
+from backend.logging import setup_logger
 from backend.operations import ForgeOperations, using_forge_operations
 from backend.patcher.clip import CLIP
 
@@ -21,12 +23,15 @@ from .files import (
     adapters,
     bundle_metadata,
     qwen35_models,
+    sidecar_metadata,
 )
 from .qwen35 import Qwen35HybridModel
 from .semantic_v2 import BundledV2Models, QualityAnchoredSemanticConnectorV2
 from .tokenizer import Qwen35Tokenizer
 
 logger = logging.getLogger(__name__)
+# Forge Neo sets the root logger to ERROR; route through its handler like the built-in modules.
+setup_logger(logger)
 LAYER_INDICES = (7, 15, 23, 31)
 
 
@@ -59,7 +64,10 @@ class Anima3BRuntime:
 
     @staticmethod
     def _require_anima(sd_model):
-        engine = getattr(sd_model, "text_processing_engine_anima", None)
+        # Forge Neo renamed text_processing_engine_anima to text_processing_engine_qwen.
+        engine = getattr(sd_model, "text_processing_engine_qwen", None)
+        if engine is None:
+            engine = getattr(sd_model, "text_processing_engine_anima", None)
         clip = getattr(getattr(sd_model, "forge_objects", None), "clip", None)
         if engine is None or clip is None:
             raise RuntimeError("Anima 3.8B requires a loaded Anima checkpoint.")
@@ -207,21 +215,30 @@ class Anima3BRuntime:
 
     @staticmethod
     def _native_inputs(native_engine, line: str, device, dtype):
-        chunks = native_engine.tokenize_line(line)
-        if len(chunks) != 1:
+        # Mirrors backend.text_processing.anima_engine.Qwen06Engine.__call__:
+        # Qwen tokens are encoded unweighted, emphasis lives on the T5 weights.
+        emphasis_name = native_engine.emphasis.name
+        disable_weights = emphasis_name == "None"
+        ignore_weights = emphasis_name == "Ignore"
+        qwen_chunks = native_engine.qwen_tokenizer.tokenize_with_weights(
+            line,
+            disable_weights=disable_weights,
+        )
+        t5_chunks = native_engine.t5_tokenizer.tokenize_with_weights(
+            line,
+            disable_weights=disable_weights,
+        )
+        if len(qwen_chunks) != 1 or len(t5_chunks) != 1:
             raise RuntimeError("Anima 3.8B expects one prompt chunk.")
-        chunk = chunks[0]
-        source = native_engine.process_tokens(
-            [chunk.qwen_tokens],
-            [chunk.qwen_multipliers],
-        )[0].unsqueeze(0)
+        qwen_chunk = [[(token, 1.0) for token, _ in qwen_chunks[0]]]
+        source = native_engine.text_encoder.encode_token_weights(qwen_chunk)[0]
         target_ids = torch.tensor(
-            chunk.t5_tokens,
+            [token for token, _ in t5_chunks[0]],
             device=device,
             dtype=torch.long,
         ).unsqueeze(0)
         target_weights = torch.tensor(
-            chunk.t5_multipliers,
+            [1.0 if ignore_weights else weight for _, weight in t5_chunks[0]],
             device=device,
             dtype=dtype,
         ).reshape(1, -1, 1)
@@ -276,6 +293,18 @@ class Anima3BRuntime:
         return native_adapter, native_rows, semantic_rows
 
     @staticmethod
+    def _native_adapter_hash(native_adapter) -> str:
+        # Same digest as bundle_v2.native_adapter_hash, over the loaded module.
+        digest = hashlib.sha256()
+        for name, tensor in sorted(native_adapter.state_dict().items()):
+            value = tensor.detach().cpu().contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(tuple(value.shape)).encode("ascii"))
+            digest.update(str(value.dtype).encode("ascii"))
+            digest.update(value.view(torch.uint8).numpy().tobytes())
+        return digest.hexdigest()
+
+    @staticmethod
     def _adapter_metadata(metadata: dict[str, str]) -> dict[str, str]:
         prefix = "anima_v2_adapter_"
         return {
@@ -299,6 +328,20 @@ class Anima3BRuntime:
         adapter_metadata = self._adapter_metadata(metadata)
         if adapter_metadata.get("architecture") != V2_ARCHITECTURE:
             raise RuntimeError("The bundled connector is not Semantic Connector v2.")
+        expected_hash = metadata.get("anima_v2_native_sha256")
+        if expected_hash:
+            actual_hash = self._native_adapter_hash(native_adapter)
+            if actual_hash != expected_hash:
+                # Expected for merges such as DeltaMix, whose official ComfyUI
+                # nodes pair the sidecar with the merged native adapter.
+                logger.info(
+                    "Anima v2 connector %s was trained against a different native "
+                    "LLM adapter (expected %s, checkpoint has %s). Normal for merged "
+                    "checkpoints; otherwise results may be degraded.",
+                    Path(bundle_path).name,
+                    expected_hash,
+                    actual_hash,
+                )
         config = {
             "num_queries": int(adapter_metadata.get("semantic_query_tokens", "64")),
             "resampler_blocks": int(
@@ -587,14 +630,23 @@ class Anima3BRuntime:
             self.restore(processing)
         checkpoint_path = self._checkpoint_path(processing.sd_model)
         metadata = bundle_metadata(checkpoint_path)
-        self._active_bundle_path = checkpoint_path if metadata is not None else None
+        connector_path = checkpoint_path
+        if metadata is None:
+            # A v2 connector sidecar selected in the adapter dropdown stands in
+            # for a bundle when the checkpoint carries no connector of its own.
+            adapter_path = adapters().get(adapter_name)
+            if adapter_path is not None:
+                metadata = sidecar_metadata(adapter_path)
+                if metadata is not None:
+                    connector_path = adapter_path
+        self._active_bundle_path = connector_path if metadata is not None else None
         self._active_bundle_metadata = metadata
         self._v2_runs.clear()
 
         original = processing.sd_model.get_learned_conditioning
         processing.sd_model._anima3b_original_get_learned_conditioning = original
         if metadata is not None:
-            self._install_v2(processing, checkpoint_path, metadata)
+            self._install_v2(processing, connector_path, metadata)
             strength = 1.0
             if negative_strength is not None:
                 negative_strength = 1.0
@@ -621,7 +673,7 @@ class Anima3BRuntime:
                     "Anima 3.8B adapter": adapter_file,
                     "Anima 3.8B strength": 1.0,
                     "Anima 3.8B architecture": V2_ARCHITECTURE,
-                    "Anima 3.8B bundle": Path(checkpoint_path).name,
+                    "Anima 3.8B bundle": Path(connector_path).name,
                 }
             )
         else:
