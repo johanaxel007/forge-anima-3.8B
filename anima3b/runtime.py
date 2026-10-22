@@ -661,8 +661,7 @@ class Anima3BRuntime:
             )
 
         processing.sd_model.get_learned_conditioning = patched
-        processing.cached_c = [None, None, None]
-        processing.cached_uc = [None, None, None]
+        self._reset_cond_caches(processing)
         if metadata is not None:
             adapter_file = metadata.get(
                 "anima_v2_adapter_filename",
@@ -714,5 +713,15 @@ class Anima3BRuntime:
         self._active_bundle_path = None
         self._active_bundle_metadata = None
         self._v2_runs.clear()
+        self._reset_cond_caches(processing)
+
+    @staticmethod
+    def _reset_cond_caches(processing) -> None:
+        # v2 conditioning holds run ids into self._v2_runs, which install()
+        # clears every batch, so every cached cond (hires ones included) must
+        # be dropped with it or the next batch reuses dangling ids.
         processing.cached_c = [None, None, None]
         processing.cached_uc = [None, None, None]
+        if hasattr(processing, "cached_hr_c"):
+            processing.cached_hr_c = [None, None, None]
+            processing.cached_hr_uc = [None, None, None]
