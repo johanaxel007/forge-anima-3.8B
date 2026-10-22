@@ -53,34 +53,55 @@ def bundle_metadata(path: str | os.PathLike) -> dict[str, str] | None:
     return metadata
 
 
+def is_v2_sidecar(metadata: dict[str, str]) -> bool:
+    return (
+        metadata.get("architecture") == SIDECAR_ARCHITECTURE
+        and metadata.get("anima_v2_bundle_format") == BUNDLE_FORMAT
+        and metadata.get("anima_v2_adapter_architecture") == V2_ARCHITECTURE
+    )
+
+
 def sidecar_metadata(path: str | os.PathLike) -> dict[str, str] | None:
     try:
         with safe_open(path, framework="pt", device="cpu") as checkpoint:
             metadata = checkpoint.metadata() or {}
     except (OSError, ValueError, SafetensorError):
         return None
-    if (
-        metadata.get("architecture") != SIDECAR_ARCHITECTURE
-        or metadata.get("anima_v2_bundle_format") != BUNDLE_FORMAT
-        or metadata.get("anima_v2_adapter_architecture") != V2_ARCHITECTURE
-    ):
-        return None
-    return metadata
+    return metadata if is_v2_sidecar(metadata) else None
+
+
+# path -> ((mtime_ns, size), is an adapter), so rescans only stat files instead of reopening every header
+_adapter_files: dict[str, tuple[tuple[int, int], bool]] = {}
+
+
+def _is_adapter_file(path: Path) -> bool:
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    cached = _adapter_files.get(str(path))
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    try:
+        with safe_open(path, framework="pt", device="cpu") as checkpoint:
+            metadata = checkpoint.metadata() or {}
+            keys = set(checkpoint.keys())
+        # v1 adapters, and v2 connector sidecars that install() accepts (same check as sidecar_metadata)
+        result = (metadata.get("architecture") == ARCHITECTURE or is_v2_sidecar(metadata)) and not any(
+            key.startswith(("timestep_gates.", "anchor_deviation")) for key in keys
+        )
+    except (OSError, ValueError, SafetensorError):
+        result = False
+    _adapter_files[str(path)] = (stamp, result)
+    return result
 
 
 def adapters() -> dict[str, str]:
     found: dict[str, str] = {}
     for root in text_encoder_roots():
         for path in root.rglob("*.safetensors"):
-            try:
-                with safe_open(path, framework="pt", device="cpu") as checkpoint:
-                    metadata = checkpoint.metadata() or {}
-                    keys = set(checkpoint.keys())
-                if metadata.get("architecture") not in (ARCHITECTURE, SIDECAR_ARCHITECTURE):
-                    continue
-                if any(key.startswith(("timestep_gates.", "anchor_deviation")) for key in keys):
-                    continue
-            except (OSError, ValueError, SafetensorError):
+            if not _is_adapter_file(path):
                 continue
             label = os.path.relpath(path, root).replace("\\", "/")
             found.setdefault(label, str(path))

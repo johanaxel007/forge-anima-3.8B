@@ -181,8 +181,14 @@ class Anima3BRuntime:
         if key == self._adapter_key and self._adapter is not None:
             return self._adapter
 
-        adapter = ProgressiveCrossAdapter(native_adapter)
         state = load_file(path, device="cpu")
+        if "layer_mix_logits" not in state:
+            raise RuntimeError(
+                f"'{name}' is not an Anima 3.8B v1 adapter. A v2 connector sidecar "
+                "is used instead of this adapter only on checkpoints without a "
+                "bundled connector."
+            )
+        adapter = ProgressiveCrossAdapter(native_adapter)
         state["parameter_bank.layer_mix_logits"] = state.pop("layer_mix_logits")
         incompatible = adapter.load_state_dict(state, strict=True)
         if incompatible.missing_keys or incompatible.unexpected_keys:
@@ -330,7 +336,16 @@ class Anima3BRuntime:
             raise RuntimeError("The bundled connector is not Semantic Connector v2.")
         expected_hash = metadata.get("anima_v2_native_sha256")
         if expected_hash:
-            actual_hash = self._native_adapter_hash(native_adapter)
+            # Informational only: never let the hash (e.g. of quantized/GGUF weights) stop generation
+            try:
+                actual_hash = self._native_adapter_hash(native_adapter)
+            except Exception as error:
+                actual_hash = expected_hash
+                logger.info(
+                    "Could not hash the native LLM adapter to compare it with %s (%s); skipping the check.",
+                    Path(bundle_path).name,
+                    error,
+                )
             if actual_hash != expected_hash:
                 # Expected for merges such as DeltaMix, whose official ComfyUI
                 # nodes pair the sidecar with the merged native adapter.
