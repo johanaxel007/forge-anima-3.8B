@@ -684,23 +684,23 @@ class Anima3BRuntime:
             )
             processing.extra_generation_params.update(
                 {
-                    "Anima 3.8B adapter": adapter_file,
-                    "Anima 3.8B strength": 1.0,
-                    "Anima 3.8B architecture": V2_ARCHITECTURE,
-                    "Anima 3.8B bundle": Path(connector_path).name,
+                    "Anima 3-8B adapter": adapter_file,
+                    "Anima 3-8B strength": 1.0,
+                    "Anima 3-8B architecture": V2_ARCHITECTURE,
+                    "Anima 3-8B bundle": Path(connector_path).name,
                 }
             )
         else:
             processing.extra_generation_params.update(
                 {
-                    "Anima 3.8B adapter": Path(adapter_name).name,
-                    "Anima 3.8B strength": float(strength),
-                    "Anima 3.8B architecture": ARCHITECTURE,
+                    "Anima 3-8B adapter": Path(adapter_name).name,
+                    "Anima 3-8B strength": float(strength),
+                    "Anima 3-8B architecture": ARCHITECTURE,
                 }
             )
         if negative_strength is not None:
             processing.extra_generation_params[
-                "Anima 3.8B negative strength"
+                "Anima 3-8B negative strength"
             ] = float(negative_strength)
 
     def restore(self, processing) -> None:
